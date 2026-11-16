@@ -843,6 +843,61 @@ fn prefers_non_blinking_text_insertion_indicator() -> Option<bool> {
     Some(unsafe { function() }.as_bool())
 }
 
+/// The height of the system message font in Slint logical pixels (pixels at 96 DPI).
+///
+/// Modified by OpenNCALayer: `SystemParametersInfoForDpi` exists only since Windows 10 1607,
+/// and importing it statically keeps the program from starting on Windows 7, so it is looked
+/// up at run time. Without it, `SystemParametersInfoW` reports the metrics at the system DPI,
+/// which are scaled back to 96 DPI.
+#[cfg(target_os = "windows")]
+fn windows_message_font_height() -> Option<f32> {
+    use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, LOGPIXELSY, ReleaseDC};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW,
+    };
+    use windows::core::{BOOL, s, w};
+    type SystemParametersInfoForDpi =
+        unsafe extern "system" fn(u32, u32, *mut core::ffi::c_void, u32, u32) -> BOOL;
+
+    let mut metrics = NONCLIENTMETRICSW {
+        cbSize: core::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..NONCLIENTMETRICSW::default()
+    };
+    let size = metrics.cbSize;
+    let out = &mut metrics as *mut _ as *mut core::ffi::c_void;
+    let for_dpi = unsafe { GetModuleHandleW(w!("user32.dll")) }
+        .ok()
+        .and_then(|user32| unsafe { GetProcAddress(user32, s!("SystemParametersInfoForDpi")) });
+    let dpi = match for_dpi {
+        Some(function) => {
+            let function: SystemParametersInfoForDpi = unsafe { core::mem::transmute(function) };
+            unsafe { function(SPI_GETNONCLIENTMETRICS.0, size, out, 0, 96) }.ok().ok()?;
+            96
+        }
+        None => {
+            unsafe {
+                SystemParametersInfoW(
+                    SPI_GETNONCLIENTMETRICS,
+                    size,
+                    Some(out),
+                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                )
+            }
+            .ok()?;
+            let screen = unsafe { GetDC(None) };
+            let dpi = unsafe { GetDeviceCaps(Some(screen), LOGPIXELSY) };
+            unsafe { ReleaseDC(None, screen) };
+            dpi
+        }
+    };
+    // `lfMessageFont.lfHeight` is in pixels at `dpi`; negative means em height, positive means
+    // cell height — magnitude is fine here.
+    let height = metrics.lfMessageFont.lfHeight.unsigned_abs();
+    (height > 0 && dpi > 0).then(|| height as f32 * 96. / dpi as f32)
+}
+
 #[cfg(xdg_desktop_settings)]
 impl Drop for Backend {
     fn drop(&mut self) {
@@ -862,30 +917,9 @@ impl i_slint_core::platform::Platform for Backend {
         }
         #[cfg(target_os = "windows")]
         if let Some(ctx) = _ctx.upgrade() {
-            use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
-            use windows::Win32::UI::WindowsAndMessaging::{
-                NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
-            };
-            let mut metrics = NONCLIENTMETRICSW {
-                cbSize: core::mem::size_of::<NONCLIENTMETRICSW>() as u32,
-                ..NONCLIENTMETRICSW::default()
-            };
-            let ok = unsafe {
-                SystemParametersInfoForDpi(
-                    SPI_GETNONCLIENTMETRICS.0,
-                    metrics.cbSize,
-                    Some(&mut metrics as *mut _ as *mut core::ffi::c_void),
-                    0,
-                    96,
-                )
-            }
-            .is_ok();
-            // `lfMessageFont.lfHeight` is in pixels at 96 DPI = Slint logical pixels;
-            // negative means em height, positive means cell height — magnitude is fine here.
-            let height = metrics.lfMessageFont.lfHeight.unsigned_abs();
-            if ok && height > 0 {
+            if let Some(height) = windows_message_font_height() {
                 ctx.set_platform_default_font_size(Some(
-                    i_slint_core::lengths::LogicalLength::new(height as f32),
+                    i_slint_core::lengths::LogicalLength::new(height),
                 ));
             }
         }
